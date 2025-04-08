@@ -1,0 +1,181 @@
+//@version=6
+// 3 Candles + Reversal Strategy_V1 + deux trois améliorations = V3
+strategy("3 candles Reversal Strategy", overlay=true, initial_capital=20000, default_qty_type=strategy.fixed, default_qty_value=1, margin_long=0, margin_short=0)
+
+// Inputs
+heures_trading = input.string("0300-1530", "Heures de trading NY EST", group="Time Filter")
+d_monday        = input.bool(title="Monday", defval=true, group="Time Filter", tooltip="Take trades on this day?", inline="days")
+d_tuesday       = input.bool(title="Tuesday", defval=true, group="Time Filter", tooltip="Take trades on this day?", inline="days")
+d_wednesday     = input.bool(title="Wednesday", defval=true, group="Time Filter", tooltip="Take trades on this day?", inline="days")
+d_thursday      = input.bool(title="Thursday", defval=true, group="Time Filter", tooltip="Take trades on this day?", inline="days")
+d_friday        = input.bool(title="Friday", defval=true, group="Time Filter", tooltip="Take trades on this day?", inline="days")
+tp = input.float(10.25, "Take profit (handles)", step=0.25, group="Fixed profit taking") // 1 point = 4 ticks (adapté à NQ)
+drawRWR = input.bool(true, "Show SL and TP on chart", group="Fixed profit taking")
+slmax = input.float(100, "Maximum SL (handles)", step=0.25, group="ATR based Stop Loss settings")
+atrPeriod = input.int(title='ATR Period', defval=5, minval=1, group="ATR based Stop Loss settings", tooltip="This setting is used in the raw ATR value calculation.  Lower values will be more reactive to recent price movement, while higher values will better indicate loger-term trend.\n\n" +
+                 "Most often this is set at either 14 or 21.\nDefault: 3")
+atrMultiplier = input.float(title='ATR Band Scale Factor', defval=10, step=0.1, minval=0.01, group="ATR based Stop Loss settings", tooltip="Scaling factor (aka multiplier) for the ATR to use for plotting the ATR bands.  " +
+                     "This will usually be between 1 and 3.\n\nDefault: 2.5")
+drawATRbands =  input.bool(false, "Show ATR channel", group="ATR based Stop Loss settings")
+timeoutPeriod = input.int(30, "Time based Exit (minutes)", minval=1, maxval=120)
+longs_allowed = input.bool(false, "LONGs allowed", group="Fixed profit taking")
+shorts_allowed =input.bool(true, "SHORTs allowed", group="Fixed profit taking")
+
+// InSession() determines if a price bar falls inside the specified session (and day)
+days = d_monday ? "2" : ""
+days := days + (d_tuesday ? "3" : "")
+days := days + (d_wednesday ? "4" : "")
+days := days + (d_thursday ? "5" : "")
+days := days + (d_friday ? "6" : "")
+
+// Restriction des heures de trading
+inKillzone = not na(time(timeframe.period, heures_trading + ":" + days, "America/New_York"))
+
+// Vérifier qu'aucun trade n'est en cours
+noTrade = strategy.position_size == 0
+var bool pending_order = false
+
+// Conditions pour un scénario BULLISH -> SHORT
+bullish_c1 = close[3] > open[3]
+bullish_c2 = close[2] > open[2]
+bullish_c3 = close[1] >= open[1]
+bullish_move_range = (high[1] - low[3]) > 15
+bullish_disp = (low[3] + 0.25*(high[3]-low[3])) < low[2] and (low[2] + 0.25*(high[2]-low[2])) < low[1]
+bearish_c4 = (close < open) and (open > close[1]) and (close < low[1])
+shortEntry = bullish_c1 and bullish_c2 and bullish_c3 and bullish_move_range and bullish_disp and bearish_c4 and noTrade and shorts_allowed
+
+// Conditions pour un scénario BEARISH -> LONG
+bearish_c1 = close[3] < open[3]
+bearish_c2 = close[2] < open[2]
+bearish_c3 = close[1] <= open[1]
+bearish_move_range = (high[3] - low[1]) > 15
+bullish_c4 = (close > open) and (open < close[1]) and (close > high[1])
+longEntry = bearish_c1 and bearish_c2 and bearish_c3 and bearish_move_range and bullish_c4 and noTrade and longs_allowed
+
+//  ATR based Stop Loss computation
+scaledATR = ta.atr(atrPeriod) * atrMultiplier
+sl = math.round(math.min(slmax,scaledATR))  // Stop Loss defined by ATR
+upperATRBand = close + scaledATR
+lowerATRBand = close - scaledATR
+
+// Définition des targets et SL
+point = syminfo.mintick * 4  // Ajustement en fonction de l'échelle de l'actif
+longTP = close + tp * point
+longSL = close - sl * point
+shortTP = close - tp * point
+shortSL = close + sl * point
+
+// TradingView alerts variables
+//    - plot_0 is the Take Profit
+//    - plot_1 is the Stop Loss
+var float TP_to_show = 0
+var float SL_to_show = 0
+var float entryPrice = 0
+if not pending_order
+    if shortEntry
+        TP_to_show := shortTP
+        SL_to_show := shortSL
+        entryPrice := close
+    else if longEntry
+        TP_to_show := longTP
+        SL_to_show := longSL
+        entryPrice := close
+plot(TP_to_show, title="Take Profit", color = color.new(color.white, 20), display = display.status_line)
+plot(SL_to_show, title="Stop Loss", color = color.new(color.white, 20), display = display.status_line)
+plot(entryPrice, title="Entry Price", color = color.new(color.white, 20), display = display.status_line)
+
+// Placer les ordres
+if shortEntry and inKillzone and not pending_order//and canTrade
+    strategy.order("Short", strategy.short, qty=1, limit=entryPrice)
+    strategy.exit("Short Exit", from_entry="Short", stop=SL_to_show, limit=TP_to_show)
+    pending_order := true
+    //label.new(bar_index, high + 10, text="Short", color=color.red, textcolor=color.white, style=label.style_label_down)
+    if drawRWR // Stop Zone (Red) and Target Zone (Green)
+        box.new(left=bar_index, right=bar_index + 8, top=SL_to_show, bottom=entryPrice, border_color=color.red, bgcolor=color.new(color.red, 80), text="SL: " + str.tostring(SL_to_show-entryPrice), text_size = size.small, text_halign = text.align_right, text_valign = text.align_top)
+        box.new(left=bar_index, right=bar_index + 8, top=entryPrice, bottom=TP_to_show, border_color=color.green, bgcolor=color.new(color.green, 80))
+
+if longEntry and inKillzone  //and canTrade
+    strategy.order("Long", strategy.long, qty=1, limit=entryPrice)
+    strategy.exit("Long Exit", from_entry="Long", stop=SL_to_show, limit=TP_to_show)
+    pending_order := true
+    //label.new(bar_index, low - 10, text="Long", color=color.green, textcolor=color.white, style=label.style_label_up)
+    if drawRWR // Stop Zone (Red) and Target Zone (Green)
+        box.new(left=bar_index, right=bar_index + 8, top=entryPrice, bottom=SL_to_show, border_color=color.red, bgcolor=color.new(color.red, 80), text="SL: " + str.tostring(entryPrice-SL_to_show), text_size = size.small, text_halign = text.align_right, text_valign = text.align_bottom)
+        box.new(left=bar_index, right=bar_index + 8, top=TP_to_show, bottom=entryPrice, border_color=color.green, bgcolor=color.new(color.green, 80))
+
+var int entryTime = 0
+var int exitTime = 0
+var bool long = false
+// Traitement spécifique à l'ouverture de la position
+if (strategy.position_size[1] == 0) and (strategy.position_size != 0)
+    entryTime := time
+    pending_order := false
+
+
+
+// ta.lowest ne fonctionne pas dans le scope du if suivant. Donc on le fait à l'extérieur
+duree_ref    = math.max(math.min((time - entryTime)/ (1000 * 60) +1, 15000),1)
+widest_bar   = ta.highest(high - low, duree_ref)
+lowest_low   = ta.lowest(duree_ref)
+highest_high = ta.highest(duree_ref)
+avgRange     = ta.sma(math.abs(close - open), 5)
+
+// Sortie du trade sur opposite engulfing candle
+if (strategy.position_size != 0)
+    long := entryPrice < TP_to_show
+    //if math.abs(close - open) > avgRange and (close > open)
+    //    strategy.close_all(comment="Opposite\nWRB Exit")
+
+// Traitement spécifique à la fermeture de la position
+if (strategy.position_size[1] != 0) and (strategy.position_size == 0)
+    // trade just closed
+    exitTime := time
+    long := entryPrice < TP_to_show
+    
+    // Calcul durée du trade
+    tradeduration_min = (exitTime - entryTime)/ (1000 * 60) + 1
+    infos = "Duration: " + str.tostring(tradeduration_min) + " min\n"
+
+    // Calcul Heat pendant le trade
+    var float heat = 0
+    if long
+        heat := entryPrice - lowest_low
+    else
+        heat :=  highest_high - entryPrice
+    infos := infos + "Heat: " + str.tostring(heat) + " hdls\n"
+
+    // Calcul de la biggest bar
+    infos := infos + "Max cdl rng: " + str.tostring(widest_bar)  + " hdls"
+    
+    // affichage des infos sur le trade
+    label.new(bar_index-tradeduration_min/2, lowest_low - 50, text=infos, color=color.blue, textcolor=color.white, style=label.style_label_up)
+
+    // Clean the plots
+    TP_to_show := 0
+    SL_to_show := 0
+    entryPrice := 0
+
+// Cancels pending order if TP reached
+if pending_order and noTrade
+    if (entryPrice > TP_to_show) and (low < TP_to_show)
+        strategy.cancel_all()
+        label.new(bar_index, low - 1, text="Cancel\nall\norders", color=color.blue, textcolor=color.white, style=label.style_label_up)
+        pending_order := false
+    else if (entryPrice < TP_to_show) and high > TP_to_show
+        strategy.cancel_all()
+        label.new(bar_index, high + 1, text="Cancel all orders", color=color.blue, textcolor=color.white, style=label.style_label_down)
+        pending_order := false
+
+
+// Time-based exit
+if strategy.position_size != 0
+    if (time - entryTime) >= timeoutPeriod * 60000  // Convert minutes to milliseconds
+        strategy.close_all(comment="Time Exit")
+        pending_order := false
+
+// Plot current position
+bgcolor(strategy.position_size > 0 ? color.new(color.blue, 90) : strategy.position_size < 0 ? color.new(color.blue, 90) : na)
+
+//ATR Band Plotting
+plot(drawATRbands ? upperATRBand : na, title="Upper ATR Band", color=color.rgb(0, 255, 0, 50), linewidth=2)
+plot(drawATRbands ? lowerATRBand : na, title="Lower ATR Band", color=color.rgb(255, 0, 0, 50), linewidth=2)
