@@ -21,6 +21,28 @@ timeoutPeriod = input.int(30, "Time based Exit (minutes)", minval=1, maxval=120)
 longs_allowed = input.bool(false, "LONGs allowed", group="Fixed profit taking")
 shorts_allowed =input.bool(true, "SHORTs allowed", group="Fixed profit taking")
 
+nb_max_win = input.int(5, "Number of wins before resizing down", group="Risk Management")
+deactivate_risk_management = input.bool(false, "Deactivate risk management", group="Risk Management")
+
+
+
+
+var bool[] WinLoss = array.new_bool(0)
+
+// Function to push a boolean into FIFO
+f_push_fifo(_arr, _val, _maxSize) =>
+    array.push(_arr, _val)
+    if array.size(_arr) > _maxSize
+        array.shift(_arr)
+
+// Function to get the last element of the FIFO
+getLastTradeResult(_array) =>
+    if array.size(WinLoss) > 0
+        array.get(_array, array.size(_array) - 1)
+    else
+        false
+
+
 // InSession() determines if a price bar falls inside the specified session (and day)
 days = d_monday ? "2" : ""
 days := days + (d_tuesday ? "3" : "")
@@ -65,12 +87,22 @@ longSL = close - sl * point
 shortTP = close - tp * point
 shortSL = close + sl * point
 
+// Vouloir prendre les profits au Low[3] diminue la performance et le Sharpe
+//if (close - low[3]) > tp
+//    shortTP := low[3]
+
+
 // TradingView alerts variables
-//    - plot_0 is the Take Profit
-//    - plot_1 is the Stop Loss
+//    - plot_0 is Entry Price
+//    - plot_1 is the Take Profit
+//    - plot_2 is the Stop Loss
 var float TP_to_show = 0
 var float SL_to_show = 0
 var float entryPrice = 0
+var float previousEquity = strategy.equity
+var bool show_trade_stats = false
+var int nb_contracts = 1
+
 if not pending_order
     if shortEntry
         TP_to_show := shortTP
@@ -80,16 +112,34 @@ if not pending_order
         TP_to_show := longTP
         SL_to_show := longSL
         entryPrice := close
+plot(entryPrice, title="Entry Price", color = color.new(color.white, 20), display = display.status_line)
 plot(TP_to_show, title="Take Profit", color = color.new(color.white, 20), display = display.status_line)
 plot(SL_to_show, title="Stop Loss", color = color.new(color.white, 20), display = display.status_line)
-plot(entryPrice, title="Entry Price", color = color.new(color.white, 20), display = display.status_line)
+
 
 // Placer les ordres
-if shortEntry and inKillzone and not pending_order//and canTrade
-    strategy.order("Short", strategy.short, qty=1, limit=entryPrice)
+if shortEntry and inKillzone and not pending_order
+
+    // label.new(bar_index, high + 10, text="Short -> Equity:" + str.tostring(strategy.equity), color=color.red, textcolor=color.white, style=label.style_label_down)
+    previousEquity := strategy.equity
+
+    // Simple Risk Management. 1 micro minimum. 
+    //          1 Win -> +1 micro. 
+    //          1 loss -> go back to 1 micro
+    //          If we have a winning streak of nb_max_win -> go back to 1 micro
+    if getLastTradeResult(WinLoss)
+        nb_contracts := nb_contracts + 1
+    else
+        nb_contracts := 1
+    if (nb_contracts > nb_max_win) or (nb_contracts < 1) or deactivate_risk_management
+        nb_contracts := 1
+
+
+
+    // Order creation
+    strategy.order("Short", strategy.short, qty=nb_contracts, limit=entryPrice)
     strategy.exit("Short Exit", from_entry="Short", stop=SL_to_show, limit=TP_to_show)
     pending_order := true
-    //label.new(bar_index, high + 10, text="Short", color=color.red, textcolor=color.white, style=label.style_label_down)
     if drawRWR // Stop Zone (Red) and Target Zone (Green)
         box.new(left=bar_index, right=bar_index + 8, top=SL_to_show, bottom=entryPrice, border_color=color.red, bgcolor=color.new(color.red, 80), text="SL: " + str.tostring(SL_to_show-entryPrice), text_size = size.small, text_halign = text.align_right, text_valign = text.align_top)
         box.new(left=bar_index, right=bar_index + 8, top=entryPrice, bottom=TP_to_show, border_color=color.green, bgcolor=color.new(color.green, 80))
@@ -126,15 +176,49 @@ if (strategy.position_size != 0)
     //if math.abs(close - open) > avgRange and (close > open)
     //    strategy.close_all(comment="Opposite\nWRB Exit")
 
-// Traitement spécifique à la fermeture de la position
+
+// Cancels pending order if TP reached
+if pending_order and noTrade
+    if (entryPrice > TP_to_show) and (low < TP_to_show)
+        if strategy.equity == previousEquity
+            label.new(bar_index, low - 1, text="Cancel\nall\norders", color=color.blue, textcolor=color.white, style=label.style_label_up)
+            strategy.cancel_all()
+        else // TP reached in less than a minute and it's a WIN
+            show_trade_stats := true
+            entryTime := time
+            lowest_low := low
+            highest_high := high
+        pending_order := false
+    else if (entryPrice < TP_to_show) and high > TP_to_show
+        strategy.cancel_all()
+        label.new(bar_index, high + 1, text="Cancel all orders", color=color.blue, textcolor=color.white, style=label.style_label_down)
+        pending_order := false
+
+// trade just closed if trade duration was more than a minute
 if (strategy.position_size[1] != 0) and (strategy.position_size == 0)
-    // trade just closed
+    show_trade_stats := true
+
+// Traitement spécifique à la fermeture de la position
+if show_trade_stats
     exitTime := time
     long := entryPrice < TP_to_show
+    infos = ""
+    if previousEquity < strategy.equity
+        infos := "WIN\n"
+        f_push_fifo(WinLoss, true, nb_max_win)
+    else
+        infos := "LOSS\n"
+        f_push_fifo(WinLoss, false, nb_max_win)
     
+    // Leverage
+    if nb_contracts > 1
+        infos := infos + "Leverage: " + str.tostring(nb_contracts) + " contracts\n"
+    else
+        infos := infos + "Leverage: " + str.tostring(nb_contracts) + " contract\n"
+
     // Calcul durée du trade
     tradeduration_min = (exitTime - entryTime)/ (1000 * 60) + 1
-    infos = "Duration: " + str.tostring(tradeduration_min) + " min\n"
+    infos := infos + "Duration: " + str.tostring(tradeduration_min) + " min\n"
 
     // Calcul Heat pendant le trade
     var float heat = 0
@@ -150,21 +234,18 @@ if (strategy.position_size[1] != 0) and (strategy.position_size == 0)
     // affichage des infos sur le trade
     label.new(bar_index-tradeduration_min/2, lowest_low - 50, text=infos, color=color.blue, textcolor=color.white, style=label.style_label_up)
 
+    if false
+        // Optional: plot the win loss stats
+        for i = 0 to array.size(WinLoss) - 1
+            label.new(bar_index, high + 50*i, str.tostring(array.get(WinLoss, i)),style=label.style_label_left, textcolor=color.white, color=color.gray)
+
     // Clean the plots
     TP_to_show := 0
     SL_to_show := 0
     entryPrice := 0
+    show_trade_stats := false
 
-// Cancels pending order if TP reached
-if pending_order and noTrade
-    if (entryPrice > TP_to_show) and (low < TP_to_show)
-        strategy.cancel_all()
-        label.new(bar_index, low - 1, text="Cancel\nall\norders", color=color.blue, textcolor=color.white, style=label.style_label_up)
-        pending_order := false
-    else if (entryPrice < TP_to_show) and high > TP_to_show
-        strategy.cancel_all()
-        label.new(bar_index, high + 1, text="Cancel all orders", color=color.blue, textcolor=color.white, style=label.style_label_down)
-        pending_order := false
+
 
 
 // Time-based exit
